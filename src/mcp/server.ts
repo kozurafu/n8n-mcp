@@ -853,6 +853,14 @@ export class N8NDocumentationMCPServer {
         tools = tools.map(tool => this.filteredToolDefinitionsCache!.get(tool.name) ?? tool);
       }
 
+      // ChatGPT custom connectors invoke tools using the connector-qualified
+      // name. Advertise that exact name so the connector bridge can validate
+      // and forward calls. The call handler below normalizes this prefix.
+      tools = tools.map(tool => ({
+        ...tool,
+        name: tool.name.startsWith('n8n_mcp.') ? tool.name : `n8n_mcp.${tool.name}`,
+      }));
+
       UIAppRegistry.injectToolMeta(tools);
       return { tools };
     });
