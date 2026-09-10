@@ -30,6 +30,8 @@ import { SessionState } from './types/session-state';
 import type { AdditionalTool } from './types/additional-tools';
 import { closeSharedDatabase } from './database/shared-database';
 import { clearOfficialMcpClientCache } from './mcp/official-mcp-access';
+import { registerOAuthRoutes } from './oauth/oauth-routes';
+import type { OAuthProvider } from './oauth/oauth-provider';
 
 dotenv.config();
 
@@ -173,6 +175,8 @@ export class SingleSessionHTTPServer {
     process.env.SESSION_TIMEOUT_MINUTES || '30', 10
   ) * 60 * 1000;
   private authToken: string | null = null;
+  private oauthProvider: OAuthProvider | null = null;
+  private oauthResourceMetadataUrl: string | null = null;
   private cleanupTimer: NodeJS.Timeout | null = null;
   private additionalTools?: AdditionalTool[];
 
@@ -475,7 +479,7 @@ export class SingleSessionHTTPServer {
         userAgent: req.get('user-agent'),
         reason
       });
-      res.setHeader('WWW-Authenticate', buildBearerChallenge(reason));
+      res.setHeader('WWW-Authenticate', this.buildAuthenticationChallenge(reason));
       res.status(401).json({
         jsonrpc: '2.0',
         error: { code: -32001, message: 'Unauthorized' },
@@ -485,7 +489,9 @@ export class SingleSessionHTTPServer {
     }
 
     const token = authHeader.slice(7).trim();
-    const isValid = this.authToken && AuthManager.timingSafeCompare(token, this.authToken);
+    const isStaticToken = !!this.authToken && AuthManager.timingSafeCompare(token, this.authToken);
+    const isOAuthToken = !!this.oauthProvider && this.oauthProvider.isValidAccessToken(token);
+    const isValid = isStaticToken || isOAuthToken;
 
     if (!isValid) {
       logger.warn('Authentication failed: Invalid token', {
@@ -493,7 +499,7 @@ export class SingleSessionHTTPServer {
         userAgent: req.get('user-agent'),
         reason: 'invalid_token'
       });
-      res.setHeader('WWW-Authenticate', buildBearerChallenge('invalid_token'));
+      res.setHeader('WWW-Authenticate', this.buildAuthenticationChallenge('invalid_token'));
       res.status(401).json({
         jsonrpc: '2.0',
         error: { code: -32001, message: 'Unauthorized' },
@@ -503,6 +509,15 @@ export class SingleSessionHTTPServer {
     }
 
     return true;
+  }
+
+  private buildAuthenticationChallenge(
+    reason: 'no_auth_header' | 'invalid_auth_format' | 'invalid_token'
+  ): string {
+    const challenge = buildBearerChallenge(reason);
+    return this.oauthResourceMetadataUrl
+      ? `${challenge}, resource_metadata="${this.oauthResourceMetadataUrl}"`
+      : challenge;
   }
 
   /**
@@ -1097,6 +1112,21 @@ export class SingleSessionHTTPServer {
    */
   async start(): Promise<void> {
     const app = express();
+
+    const rawPublicUrl = process.env.MCP_PUBLIC_URL || process.env.PUBLIC_URL || '';
+    if (!rawPublicUrl) {
+      throw new Error('MCP_PUBLIC_URL is required in HTTP mode for OAuth discovery');
+    }
+    let publicUrl: string;
+    try {
+      const parsed = new URL(rawPublicUrl);
+      if (parsed.protocol !== 'https:' && process.env.MCP_ALLOW_INSECURE_HTTP !== 'true') {
+        throw new Error('MCP_PUBLIC_URL must use HTTPS');
+      }
+      publicUrl = parsed.origin;
+    } catch (error) {
+      throw new Error(`Invalid MCP_PUBLIC_URL: ${error instanceof Error ? error.message : 'invalid URL'}`);
+    }
     
     // Create JSON parser middleware for endpoints that need it
     const jsonParser = express.json({ limit: '10mb' });
@@ -1189,6 +1219,10 @@ export class SingleSessionHTTPServer {
       }
     });
 
+    const oauth = registerOAuthRoutes(app, publicUrl, this.authToken!);
+    this.oauthProvider = oauth.provider;
+    this.oauthResourceMetadataUrl = oauth.resourceMetadataUrl;
+
     // Root endpoint with API information
     app.get('/', (req, res) => {
       const port = parseInt(process.env.PORT || '3000');
@@ -1213,8 +1247,8 @@ export class SingleSessionHTTPServer {
           }
         },
         authentication: {
-          type: 'Bearer Token',
-          header: 'Authorization: Bearer <token>',
+          type: 'OAuth 2.1 bearer token with PKCE S256',
+          authorization_server: publicUrl,
           required_for: ['POST /mcp', 'GET /mcp', 'DELETE /mcp', 'GET /sse', 'POST /messages']
         },
         documentation: 'https://github.com/czlonkowski/n8n-mcp'
@@ -1731,6 +1765,7 @@ export class SingleSessionHTTPServer {
    */
   async shutdown(): Promise<void> {
     logger.info('Shutting down Single-Session HTTP server...');
+    this.oauthProvider?.flush();
     
     // Stop session cleanup timer
     if (this.cleanupTimer) {
