@@ -91,8 +91,10 @@ RUN BUILD_HASH=$(date +%s | sha256sum | head -c 8) && \
     adduser -S nodejs -u ${UID} -G nodejs && \
     chown -R nodejs:nodejs /app
 
-# Switch to non-root user
-USER nodejs
+# Start the entrypoint as root so it can repair ownership of persistent
+# volumes mounted at /app/data. The entrypoint immediately drops privileges
+# to the non-root nodejs user with su-exec before starting the server.
+USER root
 
 # Set Docker environment flag
 ENV IS_DOCKER=true
